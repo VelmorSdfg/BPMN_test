@@ -1,0 +1,18 @@
+runs/
+# Результаты обработки 
+src/result/
+output/
+# Окружение и IDE
+test/
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+# Файлы данных и загрузки
+uploads/
+*.png
+*.jpg
+*.jpeg
