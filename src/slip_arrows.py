@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import os
 import math
+import json
+
 
 def detect_orthogonal_arrows(img_input, output_dir=None):
     if isinstance(img_input, str):
@@ -9,14 +11,16 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
     else:
         img = img_input.copy()
 
-    if img is None: return []
+    if img is None:
+        return []
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Адаптивный порог для выделения линий (инвертируем: линии белые, фон черный)
     binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY_INV, 11, 2)
     output = img.copy()
 
-    # --- 1. Поиск базовых линий ---
+    # --- 1. Поиск базовых линий (Горизонтальных и Вертикальных) ---
     def find_lines_by_direction(mask, direction='h'):
         size = 15
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, 1) if direction == 'h' else (1, size))
@@ -28,6 +32,7 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
         for cnt in cnts:
             x, y, w, h = cv2.boundingRect(cnt)
             if (w if direction == 'h' else h) < 10: continue
+            # Определяем концы сегмента
             ends = [(x, y + h // 2), (x + w, y + h // 2)] if direction == 'h' else [(x + w // 2, y),
                                                                                     (x + w // 2, y + h)]
             results.append({'rect': [int(x), int(y), int(w), int(h)], 'ends': ends, 'dir': direction.upper()})
@@ -37,7 +42,7 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
     num_segments = len(raw_segments)
     if num_segments == 0: return []
 
-    # --- 2. Построение графа связей ---
+    # --- 2. Построение графа связей (склеиваем сегменты в одну стрелку) ---
     adj = {i: set() for i in range(num_segments)}
     sphere_radius = 15
 
@@ -47,31 +52,39 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
             seg_b = raw_segments[j]
             is_connected = False
 
+            # Проверка соединения по точкам концов
             for p_a in seg_a['ends']:
                 for p_b in seg_b['ends']:
                     if math.sqrt((p_a[0] - p_b[0]) ** 2 + (p_a[1] - p_b[1]) ** 2) <= sphere_radius:
-                        is_connected = True; break
+                        is_connected = True;
+                        break
                 if is_connected: break
 
+            # Проверка вхождения конца одного сегмента в тело другого
             if not is_connected:
                 for p_a in seg_a['ends']:
                     bx, by, bw, bh = seg_b['rect']
                     if (bx - 5 <= p_a[0] <= bx + bw + 5 and by - 5 <= p_a[1] <= by + bh + 5):
-                        is_connected = True; break
+                        is_connected = True;
+                        break
                 if not is_connected:
                     for p_b in seg_b['ends']:
                         ax, ay, aw, ah = seg_a['rect']
                         if (ax - 5 <= p_b[0] <= ax + aw + 5 and ay - 5 <= p_b[1] <= ay + ah + 5):
-                            is_connected = True; break
+                            is_connected = True;
+                            break
             if is_connected:
-                adj[i].add(j); adj[j].add(i)
+                adj[i].add(j);
+                adj[j].add(i)
 
-    # --- 3. Группировка (BFS) ---
+    # --- 3. Группировка (BFS) — собираем сегменты в готовые стрелки ---
     groups = []
     visited = set()
     for i in range(num_segments):
         if i not in visited:
-            group = []; queue = [i]; visited.add(i)
+            group = [];
+            queue = [i];
+            visited.add(i)
             while queue:
                 curr = queue.pop(0)
                 group.append(raw_segments[curr])
@@ -79,7 +92,7 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
                     if n not in visited: visited.add(n); queue.append(n)
             groups.append(group)
 
-    # --- 4. Анализ и Фильтрация пустых стрелок ---
+    # --- 4. Анализ и поиск начала/конца (Start/Tip) ---
     arrows_final_data = []
 
     for g_idx, group in enumerate(groups):
@@ -95,13 +108,14 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
                         neighbor_count += 1
                     for p_o in other_seg['ends']:
                         if math.sqrt((ex - p_o[0]) ** 2 + (ey - p_o[1]) ** 2) < 12:
-                            is_internal = True; break
+                            is_internal = True;
+                            break
                     if is_internal: break
 
                 if neighbor_count > 0: is_internal = True
                 if not is_internal: external_ends.append((int(ex), int(ey)))
 
-        # Определение TIP
+        # Определение TIP (Наконечник) — ищем самый жирный конец (высокая плотность пикселей)
         best_tip = None
         max_density = -1
         for ex, ey in external_ends:
@@ -112,30 +126,39 @@ def detect_orthogonal_arrows(img_input, output_dir=None):
                 max_density = density
                 best_tip = [ex, ey]
 
-        # STARTS — внешние концы без учета tip
+        # STARTS — все внешние концы, кроме наконечника
         start_points = [p for p in external_ends if p != best_tip]
 
-        # Записываем только если стрелка не пустая
         if best_tip is not None or len(start_points) > 0:
             arrows_final_data.append({
-                "id": f"arrow_{len(arrows_final_data)}", # Пересчитываем ID, чтобы не было дырок
+                "id": f"arrow_{len(arrows_final_data)}",
                 "tip": best_tip,
                 "starts": start_points
             })
 
-            # Отрисовка  валидных стрелок
+            # Отрисовка для визуализации
             if output_dir:
-                base_color = (int(np.random.randint(50, 200)), int(np.random.randint(50, 200)), int(np.random.randint(50, 200)))
+                base_color = (int(np.random.randint(50, 200)), int(np.random.randint(50, 200)),
+                              int(np.random.randint(50, 200)))
                 for seg in group:
                     x, y, w, h = seg['rect']
                     cv2.rectangle(output, (x, y), (x + w, y + h), base_color, 2)
                 if best_tip:
-                    cv2.circle(output, (best_tip[0], best_tip[1]), 7, (0, 255, 0), -1)
+                    cv2.circle(output, (best_tip[0], best_tip[1]), 7, (0, 255, 0), -1)  # Зеленый - наконечник
                 for sp in start_points:
-                    cv2.circle(output, (sp[0], sp[1]), 5, (0, 0, 255), -1)
+                    cv2.circle(output, (sp[0], sp[1]), 5, (0, 0, 255), -1)  # Красный - начало
 
+    # --- 5. Сохранение данных в JSON и PNG ---
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+
+        # Сохраняем картинку
         cv2.imwrite(os.path.join(output_dir, '4_detected_arrows_final.png'), output)
+
+        # Сохраняем JSON
+        json_path = os.path.join(output_dir, 'detected_arrows.json')
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arrows_final_data, f, indent=4, ensure_ascii=False)
+        print(f"Готово! Данные сохранены в папку: {output_dir}")
 
     return arrows_final_data
